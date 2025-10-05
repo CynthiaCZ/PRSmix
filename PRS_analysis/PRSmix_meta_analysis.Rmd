@@ -1,0 +1,604 @@
+---
+title: "PRSmix meta analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r}
+library(meta)
+library(ggplot2)
+library(data.table)
+library(grid)
+library(dplyr)
+library(reshape2)
+library(pheatmap)
+library(patchwork)
+library(ggpubr)
+
+```
+
+```{r}
+options(bitmapType='cairo')
+```
+
+# get tables
+## COPD
+```{r}
+Table3_nhw_full <- fread("data/Table3_PRSs_copd_cgNhw.txt", data.table=F)
+Table3_aa_full <- fread("data/Table3_PRSs_copd_cgAa_test.txt", data.table=F)
+Table3_ec_full <- fread("data/Table3_PRSs_copd_ECLIPSE.txt", data.table=F)
+Table3_mgbb_all_full <- fread("data/Table3_PRSs_copd_MGBB_all.txt", data.table=F)
+Table3_aou_full <- fread("data/Table3_PRSs_copd_AoU_all.txt", data.table=F)
+```
+
+```{r}
+Table3_nhw <- Table3_nhw_full %>%
+  dplyr::select(prs = 1, beta_ci_cgNhw = 5, pval_cgNhw = 7)
+Table3_aa <- Table3_aa_full %>%
+  dplyr::select(prs = 1, beta_ci_cgAa = 5, pval_cgAa = 7)
+Table3_ec <- Table3_ec_full %>%
+  dplyr::select(prs = 1, beta_ci_ec = 5, pval_ec = 7)
+Table3_aou <- Table3_aou_full %>%
+  dplyr::select(prs = 1, beta_ci_aou = 5, pval_aou = 7)
+Table3_mgbb_all <- Table3_mgbb_all_full %>%
+  dplyr::select(prs = 1, beta_ci_mgbb = 5, pval_mgbb = 7)
+
+Table3_PRSs_copd <- Reduce(function(x, y) merge(x, y, by = "prs", all = TRUE, sort = FALSE), list(Table3_nhw, Table3_aa, Table3_ec, Table3_aou, Table3_mgbb_all))
+
+Table3_PRSs_copd_adj_p <- Table3_PRSs_copd %>%
+  filter(prs != "prs_composite") %>%
+  mutate(across(contains("pval"), ~ p.adjust(as.numeric(.x), method = "BH"))) %>%
+  rename_with(~ paste0("adj_", .), contains("pval")) %>%  
+  mutate_if(is.numeric, signif, digits=3)
+
+write.table(Table3_PRSs_copd_adj_p, "data/TableS5_PRSs_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table3_PRSs_copd_adj_p, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+## exacerbation
+```{r}
+Table4_nhw_full <- fread("data/Table4_PRSs_exacerbations_cgNhw.txt", data.table=F)
+Table4_aa_full <- fread("data/Table4_PRSs_exacerbations_cgAa_test.txt", data.table=F)
+Table4_ec_full <- fread("data/Table4_PRSs_exacerbations_ECLIPSE.txt", data.table=F)
+Table4_mgbb_all_full <- fread("data/Table4_PRSs_exacerbations_MGBB_all.txt", data.table=F)
+Table4_aou_full <- fread("data/Table4_PRSs_exacerbations_AoU_all.txt", data.table=F)
+```
+
+```{r}
+Table4_nhw <- Table4_nhw_full %>%
+  dplyr::select(prs = 1, beta_ci_cgNhw = 5, pval_cgNhw = 7)
+Table4_aa <- Table4_aa_full %>%
+  dplyr::select(prs = 1, beta_ci_cgAa = 5, pval_cgAa = 7)
+Table4_ec <- Table4_ec_full %>%
+  dplyr::select(prs = 1, beta_ci_ec = 5, pval_ec = 7)
+Table4_aou <- Table4_aou_full %>%
+  dplyr::select(prs = 1, beta_ci_aou = 5, pval_aou = 7)
+Table4_mgbb_all <- Table4_mgbb_all_full %>%
+  dplyr::select(prs = 1, beta_ci_mgbb = 5, pval_mgbb = 7)
+
+Table4_PRSs_exac <- Reduce(function(x, y) merge(x, y, by = "prs", all = TRUE, sort = FALSE), list(Table4_nhw, Table4_aa, Table4_ec, Table4_aou, Table4_mgbb_all))
+
+Table4_PRSs_exac_adj_p <- Table4_PRSs_exac %>%
+  filter(prs != "prs_composite")  %>%
+  mutate(across(contains("pval"), ~ p.adjust(as.numeric(.x), method = "BH"))) %>%
+  rename_with(~ paste0("adj_", .), contains("pval")) %>%  
+  mutate_if(is.numeric, signif, digits=3)
+
+write.table(Table4_PRSs_exac_adj_p, "data/TableS6_PRSs_exac_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_PRSs_exac_adj_p, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+# meta analysis
+## COPD
+```{r}
+Table3_dfs <- list(
+  `COPDGene NHW` = Table3_nhw_full,
+  `COPDGene AA` = Table3_aa_full,
+  ECLIPSE = Table3_ec_full,
+  `MGBB` = Table3_mgbb_all_full,
+  `All of Us` = Table3_aou_full
+)
+
+cohorts <- names(Table3_dfs)
+```
+
+```{r}
+prs_list <- c("mix_prs_copd", "FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs")
+
+Table3_meta_results <- list()
+
+for (prs in prs_list) {
+  beta_values <- numeric(length(cohorts))
+  se_values <- numeric(length(cohorts))
+  
+  # get beta and se for this prs 
+  for (i in seq_along(Table3_dfs)) {
+    df_i <- Table3_dfs[[i]]
+    
+    beta_values[i] <- df_i[df_i$prs == prs, "beta"]
+    se_values[i] <- df_i[df_i$prs == prs, "se"]
+  }
+  
+  this_prs_data <- data.frame(cohort = cohorts, beta = beta_values, se = se_values)
+  
+  # meta analysis
+  meta_analysis <- metagen(
+    TE = this_prs_data$beta,
+    seTE = this_prs_data$se,
+    studlab = this_prs_data$cohort,
+    sm = "OR"  # odds ratio
+  )
+  
+  Table3_meta_results[[prs]] <- meta_analysis
+}
+```
+
+
+### Forest plot
+```{r fig.width=10, fig.height=4}
+# BMI
+forest(Table3_meta_results$BMI_pgs, width = 10, height = 4)
+```
+
+```{r fig.width=10, fig.height=4}
+forest(Table3_meta_results$mix_prs_copd, width = 10, height = 4)
+
+pdf("plots/meta_forest_PRSmix_copd.pdf", width = 10, height = 4)
+forest(Table3_meta_results$mix_prs_copd, width = 10, height = 4)
+invisible(dev.off())
+
+jpeg("plots/meta_forest_PRSmix_copd.jpg", width = 10, height = 4, units = "in", res = 600)
+forest(Table3_meta_results$mix_prs_copd, width = 10, height = 4)
+invisible(dev.off())
+```
+
+### Random effect
+```{r}
+Table3_random_effects <- data.frame(
+  prs = character(length(prs_list)),
+  beta = numeric(length(prs_list)),
+  lower = numeric(length(prs_list)),
+  upper = numeric(length(prs_list))
+)
+
+for (i in seq_along(prs_list)) {
+  prs <- prs_list[i]
+  meta_result <- Table3_meta_results[[prs]]
+  
+  Table3_random_effects$prs[i] <- prs
+  Table3_random_effects$beta[i] <- meta_result$TE.random
+  Table3_random_effects$lower[i] <- meta_result$lower.random
+  Table3_random_effects$upper[i] <- meta_result$upper.random
+}
+```
+
+```{r fig.width=7, fig.height=3}
+prs_name_list <- c("PRS_multi", "FEV1/FVC", "FEV1", "DL spirometry", "smoking", "IPF", "BMI", "CRP")
+prs_label_list <- c(expression(bold("PRS"[multi])), expression("FEV"["1"]*"/FVC"), expression("FEV"["1"]), "DL spirometry", "smoking", "IPF", "BMI", "CRP")
+
+Table3_random_effects <- Table3_random_effects %>% mutate(prs_name = prs_name_list)
+random_effect_copd <- ggplot(Table3_random_effects, aes(x = prs_name, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_x_discrete(limits = prs_name_list, labels = prs_label_list) + 
+  labs(
+    x = "PRS",
+    y = "Random effects",
+    # title = "Random effects of association between each PRS and COPD status"
+    ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10))
+
+random_effect_copd
+
+ggsave("plots/meta_random_effect_copd.pdf", plot = random_effect_copd, device = "pdf", height = 3, width = 7)
+ggsave("plots/meta_random_effect_copd.jpg", plot = random_effect_copd, height = 3, width = 7, dpi = 600)
+```
+
+```{r fig.width=6, fig.height=3}
+random_effect_copd2 <- ggplot(Table3_random_effects, aes(x = prs_name, y = beta)) +
+  geom_point(size = 1.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_x_discrete(limits = prs_name_list, labels = prs_label_list) + 
+  labs(
+    x = "PRS",
+    y = "Random effects",
+    # title = "Random effects of association between each PRS and COPD status"
+    ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12))
+
+random_effect_copd2
+
+ggsave("plots/meta_random_effect_copd_larger_font.jpg", plot = random_effect_copd2, height = 3, width = 6, dpi = 600)
+```
+
+### Funnel plot
+```{r fig.width=6, fig.height=5}
+funnel_data <- data.frame(
+  cohort = Table3_meta_results$mix_prs_copd$studlab,
+  OR = exp(Table3_meta_results$mix_prs_copd$TE),
+  SE = Table3_meta_results$mix_prs_copd$seTE)
+
+funnel_copd <- ggplot(funnel_data, aes(x = OR, y = SE, label = cohort)) +
+  geom_point(size = 3) +
+  geom_text(size=4, vjust=-0.1, hjust = -0.1) +
+  labs(
+    x = "COPD odds ratio",
+    y = "Standard error",
+    # title = expression("Funnel plot of " * PRS[multi] * " meta-analysis results for COPD")
+  ) +
+  scale_y_reverse() +
+  scale_x_continuous(limits = c(1, 2.5)) +
+  theme_minimal() +
+  # theme(plot.title = element_text(hjust = 0.5, size = 12)
+  theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10))
+
+funnel_copd
+
+ggsave("plots/meta_funnel_PRSmix_copd.pdf", plot = funnel_copd, device = "pdf", height = 5, width = 6)
+ggsave("plots/meta_funnel_PRSmix_copd.jpg", plot = funnel_copd, height = 5, width = 6, dpi = 600)
+```
+
+
+## exacerbations
+```{r}
+Table4_dfs <- list(
+  `COPDGene NHW` = Table4_nhw_full,
+  `COPDGene AA` = Table4_aa_full,
+  ECLIPSE = Table4_ec_full,
+  `MGBB` = Table4_mgbb_all_full,
+  `All of Us` = Table4_aou_full
+)
+
+cohorts <- names(Table4_dfs)
+```
+
+```{r}
+Table4_meta_results <- list()
+
+for (prs in prs_list) {
+  beta_values <- numeric(length(cohorts))
+  se_values <- numeric(length(cohorts))
+  
+  # get beta and se for this prs 
+  for (i in seq_along(Table4_dfs)) {
+    df_i <- Table4_dfs[[i]]
+    
+    beta_values[i] <- df_i[df_i$prs == prs, "beta"]
+    se_values[i] <- df_i[df_i$prs == prs, "se"]
+  }
+  
+  this_prs_data <- data.frame(cohort = cohorts, beta = beta_values, se = se_values)
+  
+  # meta analysis
+  meta_analysis <- metagen(
+    TE = this_prs_data$beta,
+    seTE = this_prs_data$se,
+    studlab = this_prs_data$cohort,
+    sm = "MD"  # mean difference
+  )
+  
+  Table4_meta_results[[prs]] <- meta_analysis
+}
+```
+
+
+### Forest plot
+```{r fig.width=10, fig.height=4}
+# BMI
+forest(Table4_meta_results$BMI_pgs, width = 10, height = 4)
+
+pdf("plots/meta_forest_BMI_exac.pdf", width = 10, height = 4)
+forest(Table4_meta_results$BMI_pgs, width = 10, height = 4)
+invisible(dev.off())
+
+jpeg("plots/meta_forest_BMI_exac.jpg", width = 10, height = 4, units = "in", res = 600)
+forest(Table4_meta_results$BMI_pgs, width = 10, height = 4)
+invisible(dev.off())
+```
+
+```{r fig.width=10, fig.height=4}
+forest(Table4_meta_results$mix_prs_copd, width = 10, height = 4)
+
+pdf("plots/meta_forest_PRSmix_exac.pdf", width = 10, height = 4)
+forest(Table4_meta_results$mix_prs_copd, width = 10, height = 4)
+invisible(dev.off())
+
+jpeg("plots/meta_forest_PRSmix_exac.jpg", width = 10, height = 4, units = "in", res = 600)
+forest(Table4_meta_results$mix_prs_copd, width = 10, height = 4)
+invisible(dev.off())
+```
+
+### Random effect
+```{r}
+Table4_random_effects <- data.frame(
+  prs = character(length(prs_list)),
+  beta = numeric(length(prs_list)),
+  lower = numeric(length(prs_list)),
+  upper = numeric(length(prs_list))
+)
+
+for (i in seq_along(prs_list)) {
+  prs <- prs_list[i]
+  meta_result <- Table4_meta_results[[prs]]
+  
+  Table4_random_effects$prs[i] <- prs
+  Table4_random_effects$beta[i] <- meta_result$TE.random
+  Table4_random_effects$lower[i] <- meta_result$lower.random
+  Table4_random_effects$upper[i] <- meta_result$upper.random
+}
+```
+
+```{r fig.width=7, fig.height=3}
+prs_name_list <- c("PRS_multi", "FEV1/FVC", "FEV1", "DL spirometry", "smoking", "IPF", "BMI", "CRP")
+prs_label_list <- c(expression(bold("PRS"[multi])), expression("FEV"["1"]*"/FVC"), expression("FEV"["1"]), "DL spirometry", "smoking", "IPF", "BMI", "CRP")
+
+Table4_random_effects <- Table4_random_effects %>% mutate(prs_name = prs_name_list)
+random_effect_exac <- ggplot(Table4_random_effects, aes(x = prs_name, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_x_discrete(limits = prs_name_list, labels = prs_label_list) + 
+  labs(
+    x = "PRS",
+    y = "Random effects",
+    # title = "Random effects for each PRS association with exacerbations"
+    ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10))
+
+random_effect_exac
+
+ggsave("plots/meta_random_effect_exac.pdf", plot = random_effect_exac, device = "pdf", height = 3, width = 7)
+ggsave("plots/meta_random_effect_exac.jpg", plot = random_effect_exac, height = 3, width = 7, dpi = 600)
+```
+
+### Funnel plot
+```{r fig.width=6, fig.height=5}
+funnel_data <- data.frame(
+  cohort = Table4_meta_results$mix_prs_copd$studlab,
+  MD = Table4_meta_results$mix_prs_copd$TE,
+  SE = Table4_meta_results$mix_prs_copd$seTE)
+
+funnel_copd <- ggplot(funnel_data, aes(x = MD, y = SE, label = cohort)) +
+  geom_point(size = 3) +
+  geom_text(size=4, vjust=-0.1, hjust = -0.1) +
+  labs(
+    x = "Exacerbations mean difference",
+    y = "Standard error",
+    # title = expression("Funnel plot of " * PRS[multi] * " meta-analysis results for exacerbations")
+  ) +
+  scale_y_reverse() +
+  scale_x_continuous(limits = c(0, 0.6)) +
+  theme_minimal() +
+  # theme(plot.title = element_text(hjust = 0.5, size = 11))
+  theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10))
+
+funnel_copd
+
+ggsave("plots/meta_funnel_PRSmix_exac.pdf", plot = funnel_copd, device = "pdf", height = 5, width = 6)
+ggsave("plots/meta_funnel_PRSmix_exac.jpg", plot = funnel_copd, height = 5, width = 6, dpi = 600)
+```
+
+
+# Correlation heatmap
+
+```{r}
+in_path <- 'data/cgNhw_PRSmix_out_df.csv'
+df <- fread(in_path, data.table=F)
+```
+
+```{r}
+prs_list <- names(df)[grep("_pgs$", names(df))]
+prs_list <- c(prs_list, "FEV1_ePRS", "FF_ePRS")
+length(prs_list)
+```
+
+```{r}
+mapping = list(
+"mix_prs_copd" = "PRSmix",
+"FF_ePRS" = "FEV1/FVC",
+"FEV1_ePRS" = "FEV1",
+"Cosentino_pgs" = "DLspiro",
+"smoking_pgs" = "Smoking",
+"IPF_pgs" = "IPF",
+"BMI_pgs" = "BMI",
+"CRP_pgs" = "C-reactive protein",
+"emphysema_pgs" = "Emphysema",
+"PEF_pgs" = "Peak expiratory flow",
+"VTE_pgs" = "Venous thromboembolism",
+"T2D_pgs" = "Type 2 diabetes",
+"heartFailure_pgs" = "Heart failure",
+"HTN_pgs" = "Hypertension",
+"platelets_pgs" = "Platelet count",
+"OSA_pgs" = "Obstructive sleep apnea",
+"neutrophil_pgs" = "Neutrophil",
+"anxiety_pgs" = "Anxiety disorder",
+"asthma_pgs" = "Asthma",
+"corPulmonale_pgs" = "Cor pulmonale",
+"MDD_pgs" = "Major depressive disorder",
+"allergicRespDis_pgs" = "Allergic respiratory disease",
+"albumin_pgs" = "Albumin",
+"CAD_pgs" = "Coronary artery disease",
+"EOS_pgs" = "Eosinophils",
+"respInf_pgs" = "Respiratory infections"
+)
+```
+
+```{r}
+prs_list_clean <- sapply(prs_list, function(x) mapping[[x]])
+colnames(df) <- sapply(colnames(df), function(x) mapping[[x]], USE.NAMES = FALSE)
+ordered_prs <- unname(unlist(mapping))
+
+df_prs <- df[, ordered_prs]
+df_prs <- df_prs[complete.cases(df_prs[, ordered_prs]), ]
+cor_matrix <- cor(df_prs)
+```
+
+```{r fig.width=8, fig.height=7}
+heatmap <- pheatmap(
+  mat = cor_matrix,
+  clustering_method = "ward.D",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  # main = "Clustered PRS Correlation",
+  angle_col = 45
+)
+heatmap
+ggsave("plots/PRS_corr_heatmap.pdf", plot = heatmap, device = "pdf", height = 7, width = 8)
+ggsave("plots/PRS_corr_heatmap.jpg", plot = heatmap, height = 7, width = 8, dpi = 600)
+```
+
+# protein box plots
+```{r}
+summary_df <- read.table("data/TableS_topMetaXcan_summary_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+summary_df <- summary_df[order(-summary_df$count), ]
+DT::datatable(summary_df)
+```
+
+```{r}
+somascan5k <- read.table("path/to/somascan_data.txt", sep="\t", header = TRUE)
+
+metadat5k <- read.table("path/to/somascan_metadata.txt", sep='\t', header = TRUE, quote = "", fill = TRUE)
+
+# replace colnames with gene names
+new_columns <- c("sid", metadat5k$EntrezGeneSymbol)
+colnames(somascan5k) <- new_columns
+colnames(somascan5k) <- gsub("-", "_", colnames(somascan5k))
+
+# subset
+somascan_filtered <- somascan5k %>%
+  select(sid, all_of(summary_df$EntrezGeneSymbol)) %>% 
+  select(-matches("\\.1$")) # duplicates
+
+somascan_filtered[, summary_df$EntrezGeneSymbol] <- scale(somascan_filtered[, summary_df$EntrezGeneSymbol])
+```
+
+```{r}
+# pheno_p1 and pheno_p2
+miniGridDir="path/to/"
+load(paste0(miniGridDir,"miniCgGrid_datasets.Rdata"))
+
+# use P2
+# make binary copd variable
+pheno_p2$copd <- ifelse(pheno_p2$FEV1_FVC_post_P2 < 0.7 & pheno_p2$fev1_pp_gli_global_P2 < 80, 1,
+                      ifelse(pheno_p2$FEV1_FVC_post_P2 >= 0.7 & pheno_p2$fev1_pp_gli_global_P2 >= 80, 0, NA))
+
+# make binary frequent exacerbator variable
+pheno_p2$freq_exac <- ifelse(pheno_p2$total_Net_Exacerbations >= 2, 1, 0)
+
+somascan_pheno <- merge(somascan_filtered, pheno_p2[, c("sid", "copd", "freq_exac")], by = "sid")
+```
+
+
+```{r}
+# get only the PRSmix variable from P1
+pheno_nhw_full<-fread("data/cgNhw_PRSmix_out_df.csv", data.table=F)
+pheno_aa_full<-fread("data/cgAa_PRSmix_out_df.csv", data.table=F)
+
+mix_prs_nhw <- pheno_nhw_full[, c("sid", "mix_prs_copd")]
+mix_prs_aa <- pheno_aa_full[, c("sid", "mix_prs_copd")]
+
+combined_mix_prs <- rbind(mix_prs_nhw, mix_prs_aa)
+
+somascan_pheno_prs <- merge(somascan_pheno, combined_mix_prs, by = "sid", all.x = TRUE)
+```
+
+```{r}
+# top quintile of PRSmix
+top_quintile_cutoff <- quantile(somascan_pheno_prs$mix_prs_copd, 0.8, na.rm = TRUE)
+bottom_quintile_cutoff <- quantile(somascan_pheno_prs$mix_prs_copd, 0.2, na.rm = TRUE)
+
+somascan_pheno_prs$PRSmix_top_quintile <- ifelse(somascan_pheno_prs$mix_prs_copd >= top_quintile_cutoff, 1, 0)
+
+somascan_pheno_prs$quintile_group <- NA
+somascan_pheno_prs$quintile_group[somascan_pheno_prs$mix_prs_copd >= top_quintile_cutoff] <- "Top"
+somascan_pheno_prs$quintile_group[somascan_pheno_prs$mix_prs_copd <= bottom_quintile_cutoff] <- "Bottom"
+
+somascan_pheno_prs_quintile_subset <- somascan_pheno_prs %>%
+  filter(quintile_group %in% c("Top", "Bottom"))
+
+```
+
+```{r}
+table(somascan_pheno_prs$copd, useNA = "ifany")
+table(somascan_pheno_prs$freq_exac, useNA = "ifany")
+table(somascan_pheno_prs$PRSmix_top_quintile, useNA = "ifany")
+table(somascan_pheno_prs_quintile_subset$quintile_group, useNA = "ifany")
+
+somascan_pheno_prs_copd_complete <- somascan_pheno_prs %>% filter(!is.na(copd))
+somascan_pheno_prs_exac_complete <- somascan_pheno_prs %>% filter(!is.na(freq_exac))
+somascan_pheno_prs_mix_prs_complete <- somascan_pheno_prs %>% filter(!is.na(mix_prs_copd))
+```
+
+
+```{r}
+generate_combined_plot <- function(gene, p_cutoff = 0.05, log_scale = FALSE, y_limits = NULL) {
+  p1 <- t.test(somascan_pheno_prs_copd_complete[[gene]] ~ somascan_pheno_prs_copd_complete$copd)$p.value
+  p2 <- t.test(somascan_pheno_prs_exac_complete[[gene]] ~ somascan_pheno_prs_exac_complete$freq_exac)$p.value
+  p3 <- t.test(somascan_pheno_prs_quintile_subset[[gene]] ~ somascan_pheno_prs_quintile_subset$quintile_group)$p.value
+  
+  if (!(p1 < p_cutoff & p2 < p_cutoff & p3 < p_cutoff)) {
+    return(NULL)
+  }
+  
+  plot1 <- ggplot(somascan_pheno_prs_copd_complete, aes(x = factor(copd), y = .data[[gene]])) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(x = "COPD status", y = "Protein level") +
+    stat_compare_means(method = "t.test", label.y = max(somascan_pheno_prs_copd_complete[[gene]]) * 1.1) +
+    coord_cartesian(ylim = y_limits)
+  
+  plot2 <- ggplot(somascan_pheno_prs_exac_complete, aes(x = factor(freq_exac), y = .data[[gene]])) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(x = "Frequent exacerbator", y = NULL, title = gene) +
+    theme(plot.title = element_text(hjust = 0.5))  +
+    stat_compare_means(method = "t.test", label.y = max(somascan_pheno_prs_exac_complete[[gene]]) * 1.1) +
+    coord_cartesian(ylim = y_limits)
+  
+  plot3 <- ggplot(somascan_pheno_prs_quintile_subset, aes(x = factor(quintile_group), y = .data[[gene]])) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(x = "PRSmulti quintile", y = NULL) +
+    stat_compare_means(method = "t.test", label.y = max(somascan_pheno_prs[[gene]]) * 1.1) +
+    coord_cartesian(ylim = y_limits)
+  
+  if (log_scale) {
+    plot1 <- plot1 + scale_y_log10()
+    plot2 <- plot2 + scale_y_log10()
+    plot3 <- plot3 + scale_y_log10()
+  }
+  
+  combined_plot <- plot1 + plot2 + plot3 + plot_layout(ncol = 3)
+  
+  return(combined_plot)
+}
+```
+
+
+```{r}
+gene_list <- summary_df$EntrezGeneSymbol
+
+for (gene in gene_list) {
+  combined_plot <- generate_combined_plot(gene = gene)
+
+  if (!is.null(combined_plot)) {
+    print(combined_plot)
+    ggsave(filename = paste0("plots/boxplot_", gene, "_top_vs_bottom.pdf"), plot = combined_plot, device = "pdf", height = 6, width = 8)
+    ggsave(filename = paste0("plots/boxplot_", gene, "_top_vs_bottom.jpg"), plot = combined_plot, height = 6, width = 8, dpi = 600)
+
+  }
+}
+```
+

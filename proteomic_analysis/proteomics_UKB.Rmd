@@ -1,0 +1,541 @@
+---
+title: "Asscociation of metaxcan proteins in UKB olink with COPD and exacerbations"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+```{r}
+library(data.table)
+library(tableone)
+library(MatchIt)
+library(MASS)
+library(ggplot2)
+library(dplyr)
+options(bitmapType='cairo')
+set.seed(0)
+```
+
+# get data
+```{r}
+olink_df <- fread("path/to/UKB_data/olink_instance_0.csv")
+
+pheno_df <- fread("path/to/UKB_data/pheno_copd_exac_1yr.csv")
+ukb=readRDS("path/to/ukb.rds")
+```
+
+```{r}
+colnames(olink_df) <- toupper(gsub("olink_instance_0\\.", "", colnames(olink_df)))
+colnames(olink_df)[colnames(olink_df) == "EID"] <- "eid"
+
+olink_df <- olink_df %>%
+  mutate(across(-eid, scale))
+
+mapping_df <- read.table("path/to/UKB_data/olink_names_to_uniprot_ensembl.txt", sep="\t", header = TRUE)
+mapping_df <- mapping_df %>%
+  mutate(Assay = toupper(gsub("-", "_", Assay))) %>%
+  dplyr::select(-Panel) %>%
+  rename_with(~ c("UniProt", "EnsemblGeneID", "EntrezGeneSymbol"))
+
+setdiff(colnames(olink_df), mapping_df$EntrezGeneSymbol)
+
+# rename with uniprot id
+colnames(olink_df) <- mapping_df$UniProt[match(colnames(olink_df), mapping_df$EntrezGeneSymbol)]
+```
+
+```{r}
+cat("all UKB:", nrow(pheno_df), "\n")
+
+cat("exclude people without olink data:", sum(!pheno_df$eid %in% olink_df$eid), "\n")
+pheno_w_olink <- pheno_df[pheno_df$eid %in% olink_df$eid, ]
+cat("people with olink data:", nrow(pheno_w_olink), "\n")
+
+spiro <- na.omit(ukb[, c("IID", "fev1pp", "fev1fvc")])
+cat("exclude people without spirometry data:", sum(!pheno_w_olink$eid %in% spiro$IID), "\n")
+# merge with spirometry data
+pheno_w_olink_spiro <- merge(pheno_w_olink, spiro, by.x = "eid", by.y = "IID")
+cat("people with olink and spirometry:", nrow(pheno_w_olink_spiro), "\n")
+
+# fill na in pack years with zero if smoking status is zero
+pheno_w_olink_spiro$pack_years[is.na(pheno_w_olink_spiro$pack_years) & pheno_w_olink_spiro$smoking_status == 0] <- 0
+
+sapply(pheno_w_olink_spiro[, c("copd","age","sex","pack_years")], function(x) sum(is.na(x)))
+
+pheno_w_olink_spiro_complete <- pheno_w_olink_spiro[complete.cases(pheno_w_olink_spiro[, "pack_years"]), ]
+cat("after removing na in pack years:", nrow(pheno_w_olink_spiro_complete), "\n")
+
+cat("exclude people <40 years old:", sum(pheno_w_olink_spiro_complete$age < 40), "\n")
+pheno_w_olink_spiro_complete <- pheno_w_olink_spiro_complete[pheno_w_olink_spiro_complete$age >= 40, ]
+cat("after removing people <40 years old:", nrow(pheno_w_olink_spiro_complete), "\n")
+
+colnames(pheno_w_olink_spiro_complete)[colnames(pheno_w_olink_spiro_complete) == "copd"] <- "copd_icd"
+
+# make binary copd variable from spiromics
+pheno_w_olink_spiro_complete$copd <- ifelse(pheno_w_olink_spiro_complete$fev1fvc < 0.7 & pheno_w_olink_spiro_complete$fev1pp < 80, 1,
+                      ifelse(pheno_w_olink_spiro_complete$fev1fvc >= 0.7 & pheno_w_olink_spiro_complete$fev1pp >= 80, 0, NA))
+table(pheno_w_olink_spiro_complete$copd, useNA = "ifany")
+
+# remove NA in copd 
+pheno_w_olink_spiro_complete <- pheno_w_olink_spiro_complete[complete.cases(pheno_w_olink_spiro_complete[, "copd"]), ]
+cat("after removing NA in copd:", nrow(pheno_w_olink_spiro_complete))
+table(pheno_w_olink_spiro_complete$copd, useNA = "ifany")
+```
+
+```{r}
+table(pheno_w_olink_spiro_complete$total_exacerbation)
+```
+
+```{r}
+pheno_w_olink_spiro_complete %>% filter(copd == 1) %>% pull(total_exacerbation) %>% mean(na.rm = TRUE)
+pheno_w_olink_spiro_complete %>% filter(copd == 1) %>% pull(total_exacerbation) %>% sd(na.rm = TRUE)
+```
+
+# propensity score matching 
+```{r}
+m.out <- matchit(copd ~ age + sex + pack_years, 
+                 data = pheno_w_olink_spiro_complete, 
+                 method = "nearest")
+
+matched_df <- match.data(m.out)
+
+cat("after propensity matching:", nrow(matched_df))
+table(matched_df$copd)
+```
+
+```{r}
+table(matched_df$total_exacerbation)
+
+matched_df %>% filter(copd == 1) %>% pull(total_exacerbation) %>% mean(na.rm = TRUE)
+matched_df %>% filter(copd == 1) %>% pull(total_exacerbation) %>% sd(na.rm = TRUE)
+```
+
+# table one
+```{r}
+allVars <- c("age", "sex", "race", "smoking_status", "pack_years", "fev1pp", "fev1fvc", "total_exacerbation", "copd")
+catVars <- c("sex", "race", "smoking_status", "copd")
+table1 <- CreateTableOne(data = matched_df, vars = allVars, factorVars = catVars)
+table1_output <- print(table1, showAllLevels = TRUE)
+
+write.table(table1_output, "data/TableS1_demographics_ukb_olink.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+```{r}
+# covars <- c("age","sex","race","pack_years")
+covars <- c("race") # adjust for race only after propensity score matching
+adj_p_thres <- 0.1
+p_thres <- 0.05
+```
+
+# functions
+```{r}
+call_model <- function(df, outcome_name, top_genes, covars, adjustment=NULL, model_type) {
+  results <- data.frame(gene = character(), beta = numeric(), ci_lower = numeric(), ci_upper = numeric(), beta_ci = character(), pval = numeric(), stringsAsFactors = FALSE)
+
+  for (gene in top_genes) {
+    gene <- ifelse(grepl("\\-", gene), paste0("`", gene, "`"), gene)
+    formula_components <- c(gene, covars, adjustment)
+    formula_str <- paste0(outcome_name, " ~ ", paste0(formula_components, collapse = " + "))
+    
+    if (model_type == "nb") {
+      model <- glm.nb(as.formula(formula_str), data = df)
+    } else if (model_type == "binomial") {
+    model <- glm(as.formula(formula_str), data = df, family = binomial())
+    }
+
+    beta <- coef(model)[gene]
+    ci <- confint(model, gene, level = 0.95)
+    beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+    pval <- summary(model)$coefficients[gene, 4]
+    results <- rbind(results, data.frame(gene = gene, beta = beta, ci_lower = ci[1], ci_upper = ci[2], beta_ci = beta_ci, pval = pval))
+  }
+  return(results)
+}
+```
+
+```{r}
+map_genes <- function(metaxcan_df, mapping_df) {
+  
+  metaxcan_df$UniProt <- NA
+
+  for (i in seq_len(nrow(metaxcan_df))) {
+    gene <- metaxcan_df$gene[i]
+    gene_name <- metaxcan_df$gene_name[i]
+    
+    # match by ensembl id 
+    ensembl_match <- sapply(mapping_df$EnsemblGeneID, function(ids) gene %in% ids)
+    if (any(ensembl_match)) {
+      row_idx <- which(ensembl_match)[1]  # take the first match
+      metaxcan_df$UniProt[i] <- mapping_df$UniProt[row_idx]
+      next
+    }
+    
+    # If no match in ensembl id, check gene name
+    entrez_match <- sapply(mapping_df$EntrezGeneSymbol, function(symbols) gene_name %in% symbols)
+    if (any(entrez_match)) {
+      row_idx <- which(entrez_match)[1]  # take the first match
+      metaxcan_df$UniProt[i] <- mapping_df$UniProt[row_idx]
+    }
+  }
+  return(metaxcan_df)
+}
+```
+
+# BMI
+```{r}
+bmi_metaxcan <- read.csv("path/to/bmi_SPrediXcan_results.csv")
+bmi_metaxcan <- bmi_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(bmi_metaxcan))
+
+# map to uniprot id 
+bmi_metaxcan <- map_genes(bmi_metaxcan, mapping_df)
+bmi_top_genes_intersect <- unique(na.omit(bmi_metaxcan$UniProt))
+print(length(bmi_top_genes_intersect))
+
+# this only selects the first in dups
+olink_pheno_bmi <- merge(olink_df[, c("eid", ..bmi_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+bmi_genes_exac_adj_copd <- call_model(df=olink_pheno_bmi, outcome_name='total_exacerbation', top_genes=bmi_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+bmi_genes_exac_adj_copd_sig <- bmi_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+
+DT::datatable(bmi_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(bmi_genes_exac_adj_copd_sig, file = "path/to/bmi_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+bmi_genes_exac_adj_copd_sig <- read.table("path/to/bmi_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(bmi_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=12, fig.width=8}
+bmi_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(bmi_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = bmi_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+bmi_forest_plot <- ggplot(bmi_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top BMI genes with exacerbations in UKB") +
+  theme_minimal()
+bmi_forest_plot
+
+ggsave("plots/bmi_forest_plot_ukb.pdf", plot = bmi_forest_plot, device = "pdf", height = 12, width = 8)
+ggsave("plots/bmi_forest_plot_ukb.jpg", plot = bmi_forest_plot, height = 12, width = 8, dpi = 300)
+```
+
+
+# FEV1
+```{r}
+fev1_metaxcan <- read.csv("path/to/fev1_SPrediXcan_results.csv")
+fev1_metaxcan <- fev1_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(fev1_metaxcan))
+
+fev1_metaxcan <- map_genes(fev1_metaxcan, mapping_df)
+fev1_top_genes_intersect <- unique(na.omit(fev1_metaxcan$UniProt))
+print(length(fev1_top_genes_intersect))
+
+olink_pheno_fev1 <- merge(olink_df[, c("eid", ..fev1_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+fev1_genes_exac_adj_copd <- call_model(df=olink_pheno_fev1, outcome_name='total_exacerbation', top_genes=fev1_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+fev1_genes_exac_adj_copd_sig <- fev1_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+
+DT::datatable(fev1_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(fev1_genes_exac_adj_copd_sig, file = "path/to/fev1_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+fev1_genes_exac_adj_copd_sig <- read.table("path/to/fev1_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(fev1_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=8, fig.width=8}
+fev1_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(fev1_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = fev1_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+fev1_forest_plot <- ggplot(fev1_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top FEV1 genes with exacerbations in UKB") +
+  theme_minimal()
+fev1_forest_plot
+
+ggsave("plots/fev1_forest_plot_ukb.pdf", plot = fev1_forest_plot, device = "pdf", height = 8, width = 8)
+ggsave("plots/fev1_forest_plot_ukb.jpg", plot = fev1_forest_plot, height = 8, width = 8, dpi = 300)
+```
+
+
+# FF
+```{r}
+ff_metaxcan <- read.csv("path/to/ff_SPrediXcan_results.csv")
+ff_metaxcan <- ff_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(ff_metaxcan))
+
+ff_metaxcan <- map_genes(ff_metaxcan, mapping_df)
+ff_top_genes_intersect <- unique(na.omit(ff_metaxcan$UniProt))
+print(length(ff_top_genes_intersect))
+
+olink_pheno_ff <- merge(olink_df[, c("eid", ..ff_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+ff_genes_exac_adj_copd <- call_model(df=olink_pheno_ff, outcome_name='total_exacerbation', top_genes=ff_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+ff_genes_exac_adj_copd_sig <- ff_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+
+DT::datatable(ff_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(ff_genes_exac_adj_copd_sig, file = "/path/to/ff_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+ff_genes_exac_adj_copd_sig <- read.table("path/to/ff_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(ff_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=8, fig.width=8}
+ff_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(ff_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = ff_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+ff_forest_plot <- ggplot(ff_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top ratio genes with exacerbations in UKB") +
+  theme_minimal()
+ff_forest_plot
+
+ggsave("pplots/ff_forest_plot_ukb.pdf", plot = ff_forest_plot, device = "pdf", height = 8, width = 8)
+ggsave("plots/ff_forest_plot_ukb.jpg", plot = ff_forest_plot, height = 8, width = 8, dpi = 300)
+```
+
+
+# Smoking
+```{r}
+smoking_metaxcan <- read.csv("path/to/smoking_SPrediXcan_results.csv")
+smoking_metaxcan <- smoking_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(smoking_metaxcan))
+
+smoking_metaxcan <- map_genes(smoking_metaxcan, mapping_df)
+smoking_top_genes_intersect <- unique(na.omit(smoking_metaxcan$UniProt))
+print(length(smoking_top_genes_intersect))
+
+olink_pheno_smoking <- merge(olink_df[, c("eid", ..smoking_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+smoking_genes_exac_adj_copd <- call_model(df=olink_pheno_smoking, outcome_name='total_exacerbation', top_genes=smoking_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+smoking_genes_exac_adj_copd_sig <- smoking_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+
+DT::datatable(smoking_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(smoking_genes_exac_adj_copd_sig, file = "path/to/smoking_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+smoking_genes_exac_adj_copd_sig <- read.table("path/to/smoking_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(smoking_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=4, fig.width=8}
+smoking_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(smoking_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = smoking_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+smoking_forest_plot <- ggplot(smoking_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  ylim(c(-0.2, 0.4)) +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top smoking genes with exacerbations in UKB") +
+  theme_minimal()
+smoking_forest_plot
+
+ggsave("plots/smoking_forest_plot_ukb.pdf", plot = smoking_forest_plot, device = "pdf", height = 4, width = 8)
+ggsave("plots/smoking_forest_plot_ukb.jpg", plot = smoking_forest_plot, height = 4, width = 8, dpi = 300)
+```
+
+
+# IPF
+```{r}
+ipf_metaxcan <- read.csv("path/to/ipf_SPrediXcan_results.csv")
+ipf_metaxcan <- ipf_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(ipf_metaxcan))
+
+ipf_metaxcan <- map_genes(ipf_metaxcan, mapping_df)
+ipf_top_genes_intersect <- unique(na.omit(ipf_metaxcan$UniProt))
+print(length(ipf_top_genes_intersect))
+
+olink_pheno_ipf <- merge(olink_df[, c("eid", ..ipf_top_genes_intersect)], matched_df, by = "eid")
+```
+
+
+```{r, eval=FALSE}
+ipf_genes_exac_adj_copd <- call_model(df=olink_pheno_ipf, outcome_name='total_exacerbation', top_genes=ipf_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+ipf_genes_exac_adj_copd_sig <- ipf_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(adj_p)
+
+DT::datatable(ipf_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(ipf_genes_exac_adj_copd_sig, file = "path/to/ipf_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+ipf_genes_exac_adj_copd_sig <- read.table("path/to/ipf_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(ipf_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=4, fig.width=8}
+ipf_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(ipf_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = ipf_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+ipf_forest_plot <- ggplot(ipf_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top IPF genes with exacerbations in UKB") +
+  theme_minimal()
+ipf_forest_plot
+
+ggsave("plots/ipf_forest_plot_ukb.pdf", plot = ipf_forest_plot, device = "pdf", height = 4, width = 8)
+ggsave("plots/ipf_forest_plot_ukb.jpg", plot = ipf_forest_plot, height = 4, width = 8, dpi = 300)
+```
+
+
+# DL spiro
+```{r}
+cosentino_metaxcan <- read.csv("path/to/Cosentino_SPrediXcan_results.csv")
+cosentino_metaxcan <- cosentino_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(cosentino_metaxcan))
+
+cosentino_metaxcan <- map_genes(cosentino_metaxcan, mapping_df)
+cosentino_top_genes_intersect <- unique(na.omit(cosentino_metaxcan$UniProt))
+print(length(cosentino_top_genes_intersect))
+
+olink_pheno_cosentino <- merge(olink_df[, c("eid", ..cosentino_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+cosentino_genes_exac_adj_copd <- call_model(df=olink_pheno_cosentino, outcome_name='total_exacerbation', top_genes=cosentino_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+cosentino_genes_exac_adj_copd_sig <- cosentino_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+
+DT::datatable(cosentino_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(cosentino_genes_exac_adj_copd_sig, file = "path/to/cosentino_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+cosentino_genes_exac_adj_copd_sig <- read.table("path/to/cosentino_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(cosentino_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=4, fig.width=8}
+cosentino_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(cosentino_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = cosentino_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+cosentino_forest_plot <- ggplot(cosentino_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top Cosentino et al. genes with exacerbations in UKB") +
+  theme_minimal()
+cosentino_forest_plot
+
+ggsave("plots/cosentino_forest_plot_ukb.pdf", plot = cosentino_forest_plot, device = "pdf", height = 4, width = 8)
+ggsave("plots/cosentino_forest_plot_ukb.jpg", plot = cosentino_forest_plot, height = 4, width = 8, dpi = 300)
+```
+
+
+# CRP
+```{r}
+CRP_metaxcan <- read.csv("path/to/CRP_SPrediXcan_results.csv")
+CRP_metaxcan <- CRP_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(CRP_metaxcan))
+
+CRP_metaxcan <- map_genes(CRP_metaxcan, mapping_df)
+CRP_top_genes_intersect <- unique(na.omit(CRP_metaxcan$UniProt))
+print(length(CRP_top_genes_intersect))
+
+olink_pheno_CRP <- merge(olink_df[, c("eid", ..CRP_top_genes_intersect)], matched_df, by = "eid")
+```
+
+```{r, eval=FALSE}
+CRP_genes_exac_adj_copd <- call_model(df=olink_pheno_CRP, outcome_name='total_exacerbation', top_genes=CRP_top_genes_intersect, covars=covars, adjustment='copd', model_type="nb")
+
+CRP_genes_exac_adj_copd_sig <- CRP_genes_exac_adj_copd %>%
+  mutate(adj_p=p.adjust(pval,method = "BH"))  %>% 
+  filter(pval < p_thres) %>%
+  merge(unique(mapping_df[, c("UniProt", "EntrezGeneSymbol")]), by.x="gene", by.y="UniProt") %>% 
+  arrange(pval)
+DT::datatable(CRP_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+
+write.table(CRP_genes_exac_adj_copd_sig, file = "path/to/CRP_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+CRP_genes_exac_adj_copd_sig <- read.table("path/to/CRP_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+DT::datatable(CRP_genes_exac_adj_copd_sig[, c("EntrezGeneSymbol", "beta_ci", "pval", "adj_p")], rownames = FALSE)
+```
+
+```{r, fig.height=8, fig.width=8}
+CRP_genes_exac_adj_copd_sig$EntrezGeneSymbol <- factor(CRP_genes_exac_adj_copd_sig$EntrezGeneSymbol, levels = CRP_genes_exac_adj_copd_sig$EntrezGeneSymbol)
+
+CRP_forest_plot <- ggplot(CRP_genes_exac_adj_copd_sig, aes(x = EntrezGeneSymbol, y = beta)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  labs(x = "Gene", y = "Beta with 95% CI", title = "Associations of top CRP genes with exacerbations in UKB") +
+  theme_minimal()
+CRP_forest_plot
+
+ggsave("plots/CRP_forest_plot_ukb.pdf", plot = CRP_forest_plot, device = "pdf", height = 8, width = 8)
+ggsave("plots/CRP_forest_plot_ukb.jpg", plot = CRP_forest_plot, height = 8, width = 8, dpi = 300)
+```

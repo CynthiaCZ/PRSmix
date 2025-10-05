@@ -1,0 +1,405 @@
+---
+title: "combine metaxcan, COPDgene somascan, ukb olink"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+options(bitmapType='cairo')
+```
+
+Metascan analysis: gwas_tools_harmonization.sh -> gwas_tools_imputation.sh -> gwas_tools_imputation_collate.sh -> predixcan.sh
+Metascan genes analyzed in COPDgene somascan: proteomcs_COPDGene.Rmd
+Metascan genes analyzed in UKB olink: proteomics_UKB.Rmd
+
+# load data
+```{r}
+metadat5k <- read.table("path/to/somascan_metadata.txt", sep='\t', header = TRUE, quote = "", fill = TRUE)
+```
+
+# functions
+```{r}
+# function for checking concordance between beta of copdgene and ukb
+compare_betas <- function(beta1, beta2) {
+  beta1_sign <- substr(beta1, 1, 1)
+  beta2_sign <- substr(beta2, 1, 1)
+    if ((beta1_sign == "-" && beta2_sign == "-") || 
+      (beta1_sign != "-" && beta2_sign != "-")) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+```
+
+
+```{r}
+map_genes <- function(metaxcan_df, mapping_df) {
+  
+  metaxcan_df$UniProt <- NA
+
+  for (i in seq_len(nrow(metaxcan_df))) {
+    gene <- metaxcan_df$gene[i]
+    gene_name <- metaxcan_df$gene_name[i]
+    
+    # match by ensembl id 
+    ensembl_match <- sapply(mapping_df$EnsemblGeneList, function(ids) gene %in% ids)
+    if (any(ensembl_match)) {
+      row_idx <- which(ensembl_match)[1]  # take the first match
+      metaxcan_df$UniProt[i] <- mapping_df$UniProt[row_idx]
+      next
+    }
+    
+    # If no match in ensembl id, check gene name
+    entrez_match <- sapply(mapping_df$EntrezGeneList, function(symbols) gene_name %in% symbols)
+    if (any(entrez_match)) {
+      row_idx <- which(entrez_match)[1]  # take the first match
+      metaxcan_df$UniProt[i] <- mapping_df$UniProt[row_idx]
+    }
+  }
+  return(metaxcan_df)
+}
+```
+
+```{r}
+mapping_df <- metadat5k[, c("HGNCID", "EnsemblGeneID", "UniProt", "EntrezGeneSymbol")]
+
+mapping_df$EnsemblGeneList <- strsplit(as.character(mapping_df$EnsemblGeneID), "\\|")
+mapping_df$EntrezGeneList <- strsplit(as.character(mapping_df$EntrezGeneSymbol), "\\|")
+
+print(nrow(mapping_df))
+mapping_df<-unique(mapping_df)
+print(nrow(mapping_df))
+
+adj_p_thres <- 0.1
+```
+
+
+# FF
+```{r}
+ff_metaxcan <- read.csv("path/to/ff_SPrediXcan_results.csv")
+ff_metaxcan <- ff_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(ff_metaxcan))
+
+ff_metaxcan <- map_genes(ff_metaxcan, mapping_df)
+```
+
+```{r}
+ff_sig_genes_cg_adj_copd <- read.table("path/to/ff_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+ff_sig_genes_ukb_adj_copd <- read.table("path/to/ff_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_ff_adj_copd <- merge(ff_metaxcan[, c("UniProt", "zscore", "adj_p")], ff_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_ff_adj_copd <- merge(Table4_ff_adj_copd, ff_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_ff_adj_copd <- Table4_ff_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_ff_adj_copd, "data/TableS7_topMetaXcan_results_ff_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_ff_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# FEV1
+```{r}
+fev1_metaxcan <- read.csv("path/to/fev1_SPrediXcan_results.csv")
+
+fev1_metaxcan <- fev1_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(fev1_metaxcan))
+
+fev1_metaxcan <- map_genes(fev1_metaxcan, mapping_df)
+```
+
+```{r}
+fev1_sig_genes_cg_adj_copd <- read.table("path/to/fev1_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+fev1_sig_genes_ukb_adj_copd <- read.table("path/to/fev1_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_fev1_adj_copd <- merge(fev1_metaxcan[, c("UniProt", "zscore", "adj_p")], fev1_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_fev1_adj_copd <- merge(Table4_fev1_adj_copd, fev1_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_fev1_adj_copd <- Table4_fev1_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_fev1_adj_copd, "data/TableS7_topMetaXcan_results_fev1_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_fev1_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# DL spiro
+```{r}
+cosentino_metaxcan <- read.csv("path/to/Cosentino_SPrediXcan_results.csv")
+cosentino_metaxcan <- cosentino_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(cosentino_metaxcan))
+
+cosentino_metaxcan <- map_genes(cosentino_metaxcan, mapping_df)
+```
+
+```{r}
+cosentino_sig_genes_cg_adj_copd <- read.table("path/to/cosentino_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+cosentino_sig_genes_ukb_adj_copd <- read.table("path/to/cosentino_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_cosentino_adj_copd <- merge(cosentino_metaxcan[, c("UniProt", "zscore", "adj_p")], cosentino_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_cosentino_adj_copd <- merge(Table4_cosentino_adj_copd, cosentino_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_cosentino_adj_copd <- Table4_cosentino_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_cosentino_adj_copd, "data/TableS7_topMetaXcan_results_cosentino_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_cosentino_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# Smoking
+```{r}
+smoking_metaxcan <- read.csv("path/to/smoking_SPrediXcan_results.csv")
+smoking_metaxcan <- smoking_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(smoking_metaxcan))
+
+smoking_metaxcan <- map_genes(smoking_metaxcan, mapping_df)
+```
+
+```{r}
+# with adjustment for COPD 
+smoking_sig_genes_cg_adj_copd <- read.table("path/to/smoking_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+smoking_sig_genes_ukb_adj_copd <- read.table("path/to/smoking_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_smoking_adj_copd <- merge(smoking_metaxcan[, c("UniProt", "zscore", "adj_p")], smoking_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_smoking_adj_copd <- merge(Table4_smoking_adj_copd, smoking_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_smoking_adj_copd <- Table4_smoking_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_smoking_adj_copd, "data/TableS7_topMetaXcan_results_smoking_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_smoking_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# IPF
+```{r}
+ipf_metaxcan <- read.csv("path/to/ipf_SPrediXcan_results.csv")
+ipf_metaxcan <- ipf_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(ipf_metaxcan))
+
+ipf_metaxcan <- map_genes(ipf_metaxcan, mapping_df)
+```
+
+```{r}
+# with adjustment for COPD 
+ipf_sig_genes_cg_adj_copd <- read.table("path/to/ipf_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+ipf_sig_genes_ukb_adj_copd <- read.table("path/to/ipf_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_ipf_adj_copd <- merge(ipf_metaxcan[, c("UniProt", "zscore", "adj_p")], ipf_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_ipf_adj_copd <- merge(Table4_ipf_adj_copd, ipf_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_ipf_adj_copd <- Table4_ipf_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_ipf_adj_copd, "data/TableS7_topMetaXcan_results_ipf_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_ipf_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# BMI
+```{r}
+bmi_metaxcan <- read.csv("path/to/bmi_SPrediXcan_results.csv")
+bmi_metaxcan <- bmi_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(bmi_metaxcan))
+
+bmi_metaxcan <- map_genes(bmi_metaxcan, mapping_df)
+```
+
+```{r}
+# with adjustment for COPD 
+bmi_sig_genes_cg_adj_copd <- read.table("path/to/bmi_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+bmi_sig_genes_ukb_adj_copd <- read.table("path/to/bmi_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_bmi_adj_copd <- merge(bmi_metaxcan[, c("UniProt", "zscore", "adj_p")], bmi_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_bmi_adj_copd <- merge(Table4_bmi_adj_copd, bmi_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+
+```{r}
+Table4_bmi_adj_copd <- Table4_bmi_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_bmi_adj_copd, "data/TableS7_topMetaXcan_results_bmi_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_bmi_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+
+# CRP
+```{r}
+crp_metaxcan <- read.csv("path/to/CRP_SPrediXcan_results.csv")
+crp_metaxcan <- crp_metaxcan %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(adj_p = p.adjust(pvalue, method = "BH")) %>%
+  filter(adj_p < adj_p_thres)
+print(nrow(crp_metaxcan))
+
+crp_metaxcan <- map_genes(crp_metaxcan, mapping_df)
+```
+
+```{r}
+# with adjustment for COPD 
+crp_sig_genes_cg_adj_copd <- read.table("path/to/CRP_exac_signif_genes_adj_copd_adj_p_log_time.txt", sep = "\t", header = TRUE)
+
+crp_sig_genes_ukb_adj_copd <- read.table("path/to/CRP_exac_signif_genes_adj_copd_adj_p.txt", sep = "\t", header = TRUE)
+
+Table4_crp_adj_copd <- merge(crp_metaxcan[, c("UniProt", "zscore", "adj_p")], crp_sig_genes_cg_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_MetaXcan", "_COPDGene"))
+Table4_crp_adj_copd <- merge(Table4_crp_adj_copd, crp_sig_genes_ukb_adj_copd[, c("gene", "beta_ci", "pval", "adj_p")], by.x = "UniProt", by.y = "gene", suffixes = c("_COPDGene", "_UKB"))
+```
+
+```{r}
+Table4_crp_adj_copd <- Table4_crp_adj_copd %>%
+  rename(zscore_MetaXcan = zscore, adj_p_UKB = adj_p) %>% 
+  mutate(concordance = mapply(compare_betas, beta_ci_COPDGene, beta_ci_UKB)) %>%
+  filter(adj_p_COPDGene < adj_p_thres & adj_p_UKB < adj_p_thres) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>%
+  dplyr::select(-pval_COPDGene, -pval_UKB) %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt) %>%
+  arrange(EntrezGeneSymbol)
+
+write.table(Table4_crp_adj_copd, "data/TableS7_topMetaXcan_results_crp_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+DT::datatable(Table4_crp_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+# total number of unique genes 
+```{r}
+all_metaxcan_sig <- c(ff_metaxcan[ff_metaxcan$adj_p < adj_p_thres, "gene"], fev1_metaxcan[fev1_metaxcan$adj_p < adj_p_thres, "gene"], cosentino_metaxcan[cosentino_metaxcan$adj_p < adj_p_thres, "gene"], smoking_metaxcan[smoking_metaxcan$adj_p < adj_p_thres, "gene"], ipf_metaxcan[ipf_metaxcan$adj_p < adj_p_thres, "gene"], crp_metaxcan[crp_metaxcan$adj_p < adj_p_thres, "gene"])
+length(unique(all_metaxcan_sig))
+```
+
+```{r}
+all_sig_gene_adj_copd <- c(Table4_ff_adj_copd$UniProt, Table4_fev1_adj_copd$UniProt, Table4_cosentino_adj_copd$UniProt, Table4_smoking_adj_copd$UniProt, Table4_ipf_adj_copd$UniProt, Table4_bmi_adj_copd$UniProt, Table4_crp_adj_copd$UniProt)
+length(unique(all_sig_gene_adj_copd))
+```
+
+# summery count table
+```{r}
+Table4_ff_concordant_adj_copd <- Table4_ff_adj_copd[Table4_ff_adj_copd$concordance == 1, ]
+Table4_fev1_concordant_adj_copd <- Table4_fev1_adj_copd[Table4_fev1_adj_copd$concordance == 1, ]
+Table4_cosentino_concordant_adj_copd <- Table4_cosentino_adj_copd[Table4_cosentino_adj_copd$concordance == 1, ]
+Table4_smoking_concordant_adj_copd <- Table4_smoking_adj_copd[Table4_smoking_adj_copd$concordance == 1, ]
+Table4_ipf_concordant_adj_copd <- Table4_ipf_adj_copd[Table4_ipf_adj_copd$concordance == 1, ]
+Table4_bmi_concordant_adj_copd <- Table4_bmi_adj_copd[Table4_bmi_adj_copd$concordance == 1, ]
+Table4_crp_concordant_adj_copd <- Table4_crp_adj_copd[Table4_crp_adj_copd$concordance == 1, ]
+
+all_genes_adj_copd <- unique(c(Table4_ff_concordant_adj_copd$UniProt, Table4_fev1_concordant_adj_copd$UniProt, Table4_cosentino_concordant_adj_copd$UniProt, Table4_smoking_concordant_adj_copd$UniProt, Table4_ipf_concordant_adj_copd$UniProt, Table4_bmi_concordant_adj_copd$UniProt, Table4_crp_concordant_adj_copd$UniProt))
+
+summary_df_adj_copd <- data.frame(UniProt = all_genes_adj_copd)
+
+summary_df_adj_copd$in_ff <- as.integer(summary_df_adj_copd$UniProt %in% Table4_ff_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_fev1 <- as.integer(summary_df_adj_copd$UniProt %in% Table4_fev1_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_cosentino <- as.integer(summary_df_adj_copd$UniProt %in% Table4_cosentino_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_smoking <- as.integer(summary_df_adj_copd$UniProt %in% Table4_smoking_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_ipf <- as.integer(summary_df_adj_copd$UniProt %in% Table4_ipf_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_bmi <- as.integer(summary_df_adj_copd$UniProt %in% Table4_bmi_concordant_adj_copd$UniProt)
+summary_df_adj_copd$in_crp <- as.integer(summary_df_adj_copd$UniProt %in% Table4_crp_concordant_adj_copd$UniProt)
+
+summary_df_adj_copd$count <- rowSums(summary_df_adj_copd[ , 2:8])
+
+summary_df_adj_copd <-summary_df_adj_copd %>%
+  merge(mapping_df[, c("UniProt", "HGNCID", "EntrezGeneSymbol")], by = "UniProt") %>%
+  arrange(desc(count), EntrezGeneSymbol) %>% 
+  relocate(HGNCID, .before = UniProt) %>% 
+  relocate(EntrezGeneSymbol, .after = UniProt)
+
+print(nrow(summary_df_adj_copd))
+
+DT::datatable(summary_df_adj_copd, rownames = FALSE, options=list(autoWidth = TRUE, scrollX = '400px'))
+
+write.table(summary_df_adj_copd, "data/Table3_topMetaXcan_summary_adj_copd_adj_p_log_time.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+summary_df_adj_copd$EntrezGeneSymbol 
+```
+

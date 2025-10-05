@@ -1,0 +1,216 @@
+---
+title: "PRSmix test in MGBB Combined"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(tableone)
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(pROC)
+library(ResourceSelection)
+library(MatchIt)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+options(bitmapType='cairo')
+
+# import functions 
+source("PRSmix_functions.R")
+```
+
+```{r}
+df=fread("data/pheno_mgbb.csv",data.table=F)
+covars = c("Age", "Gender", "Smoking_flag_Biobank", "BMI", "Race_Group")
+pcs <- paste0("PC",1:5)
+```
+
+```{r}
+df_remove = fread("path/to/MGBB_binary/samples_to_remove.csv",data.table=F)
+```
+
+```{r}
+scores_dir <- "path/to/plink_scores_mgbb"
+
+prs_list <- c("FF", "FEV1", "Cosentino", "smoking", "IPF", "BMI", "CRP")
+
+for (prs in prs_list) {
+  dirs <- list.dirs(scores_dir, recursive = FALSE, full.names = TRUE)
+  folder <- grep(paste0("^", prs), basename(dirs), value = TRUE, ignore.case = TRUE)
+  prs_file <- file.path(scores_dir, folder, "collated.csv")
+  # print(prs_file)
+  prs_data <- fread(prs_file, data.table = F)
+  names(prs_data) <- c("IID", paste0(prs, "_pgs"))
+  
+  prs_dedup <- prs_data[!(prs_data$IID %in% df_remove$sample_to_remove), ]
+  prs_dedup$Subject_Id <- as.integer(sapply(strsplit(prs_dedup$IID, "-"), function(x) x[length(x)]))
+  
+  df <- merge(df, prs_dedup[, c("Subject_Id", paste0(prs, "_pgs"))], by.x = "sample_name", by.y = "Subject_Id")
+}
+```
+
+
+```{r}
+all_pgs_list <- names(df)[grep("_pgs$", names(df))]
+
+for (prs in all_pgs_list) {
+  print(prs)
+  df[[prs]] = scale(df[[prs]])
+  model <- glm(copd ~ df[[prs]], data = df, family = "binomial")
+  
+  coef <- summary(model)$coefficients[2, 1] 
+  p_value <- summary(model)$coefficients[2, 4]
+  
+  if (p_value <= 0.05) {
+    print(paste("p_value:", p_value, "coef:", coef))
+    if (coef < 0) {
+      df[[prs]] <- df[[prs]] * -1
+    }
+  } else {
+    print("No significant association with copd")
+  }
+}
+
+df <- df %>% rename(FEV1_ePRS = FEV1_pgs) %>% rename(FF_ePRS = FF_pgs)
+
+# make composite prs
+df$prs_composite <- 0.43847 * df$FEV1_ePRS + 0.58833 * df$FF_ePRS
+df$prs_composite <- scale(df$prs_composite)
+```
+```{r}
+print(nrow(df))
+all_prs <- c("FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs", "prs_composite")
+sapply(df[c(all_prs, pcs, covars)], function(x) sum(is.na(x)))
+
+# remove NAs
+df <- df[!(is.na(df$Smoking_flag_Biobank) | is.na(df$BMI)), ]
+print(nrow(df))
+sapply(df[c(all_prs, pcs, covars)], function(x) sum(is.na(x)))
+```
+
+```{r}
+# already filtered for people older than 40 in get_MGBB_pheno_PC.ipynb
+df %>%
+  filter(copd == 1) %>%
+  count(Smoking_flag_Biobank)
+
+print(sum(df$copd))
+df <- df %>%
+  mutate(copd = if_else(Smoking_flag_Biobank == 0, 0, copd, missing = copd))
+print(sum(df$copd))
+```
+```{r}
+df %>% filter(copd == 1) %>% pull(total_exacerbations) %>% mean(na.rm = TRUE)
+df %>% filter(copd == 1) %>% pull(total_exacerbations) %>% sd(na.rm = TRUE)
+```
+
+```{r}
+allVars <- c("Age", "Gender", "Race_Group", "Smoking_flag_Biobank", "BMI", "copd", "total_exacerbations")
+catVars <- c("Gender", "Race_Group", "Smoking_flag_Biobank", "copd")
+table1 <- CreateTableOne(data = df, vars = allVars, factorVars = catVars)
+table1_output <- print(table1, showAllLevels = TRUE)
+
+write.table(table1_output, "data/Table1_demographics_mgbb_all.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+# Use weights from PRSmix trained in COPD NHW to weigh PRSs
+```{r}
+df <- scale_PRSmix_other_coh(df, outcome_name_copd="copd", coh="cgNhw")
+```
+
+
+# Table3_PRSs_copd: COPD predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+Table3_PRSs_copd <- call_model_other_coh(df, outcome_name_copd="copd", outcome_name_other_coh="copd", pcs, covars, model_type = "binomial", adjustment = NULL, coh = "cgNhw", additional_prs = "prs_composite")
+
+prs_order <- c("FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs", "mix_prs_copd", "prs_composite")
+
+Table3_PRSs_copd <- Table3_PRSs_copd[order(match(Table3_PRSs_copd$prs, prs_order)), ]
+
+write.table(Table3_PRSs_copd, "data/Table3_PRSs_copd_MGBB_all.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+Table3_PRSs_copd <- Table3_PRSs_copd %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table3_PRSs_copd, rownames = FALSE)
+```
+
+# Table4_PRSs_exacerbations: exacerbation predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+Table4_PRSs_exacerbations <- call_model_other_coh(df, outcome_name_copd="copd", outcome_name_other_coh="total_exacerbations", pcs, covars, model_type = "nb", adjustment = NULL, coh = "cgNhw", additional_prs = "prs_composite")
+
+Table4_PRSs_exacerbations <- Table4_PRSs_exacerbations[order(match(Table4_PRSs_exacerbations$prs, prs_order)), ]
+
+write.table(Table4_PRSs_exacerbations, "data/Table4_PRSs_exacerbations_MGBB_all.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+Table4_PRSs_exacerbations <- Table4_PRSs_exacerbations %>% mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table4_PRSs_exacerbations, rownames = FALSE)
+```
+
+## ROC of COPD predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_copd_complete <- df[complete.cases(df[, c("copd", covars)]), ]
+outcome_binary <- "copd"
+
+# print DeLong p-values for PRS-mix vs FF PRS
+copd_roc_out <- compare_roc_5_models(df_copd_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "COPD predicted by PRSmix vs. FEV1/FVC PRS in MGBB")
+
+DT::datatable(copd_roc_out$auc_table)
+DT::datatable(copd_roc_out$pval_table)
+```
+
+## ROC of exacerbations predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_exac_complete <- df[complete.cases(df[, c("total_exacerbations", covars)]), ]
+
+outcome <- "total_exacerbations"
+outcome_binary <- paste0(outcome, "_binary")
+df_exac_complete[[outcome_binary]] <- ifelse(df_exac_complete[[outcome]] >= 2, 1, 0)
+
+# print DeLong p-values for PRS-mix vs FF PRS
+exac_roc_out <- compare_roc_5_models(df_exac_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "Exacerbations predicted by PRSmix vs. FEV1/FVC PRS in MGBB")
+
+DT::datatable(exac_roc_out$auc_table)
+DT::datatable(exac_roc_out$pval_table)
+```
+
+# incident rate ratio
+```{r}
+youden_threshold_copd <- 0.3752354
+
+df$youden_group <- ifelse(df$mix_prs_copd > youden_threshold_copd, 1, 0)
+table(df$youden_group)
+```
+
+```{r}
+df_youden_complete <- df[complete.cases(df[covars]), ]
+
+# get propensity score
+formula_str <- paste0("youden_group ~ ", paste0(c(covars), collapse = " + "))
+
+# propensity score matching 
+m.out <- matchit(as.formula(formula_str), 
+                 data = df_youden_complete, 
+                 method = "nearest")
+
+matched_df <- match.data(m.out)
+```
+
+```{r}
+# calculate irr
+formula_str <- paste0("total_exacerbations", " ~ youden_group + ", paste0(c(pcs), collapse = " + "))
+irr_model <- glm.nb(as.formula(formula_str), data = matched_df)
+summary(irr_model)
+```
+
+```{r}
+cor(df$BMI, df$BMI_pgs, use = "complete.obs")
+```

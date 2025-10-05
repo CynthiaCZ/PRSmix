@@ -1,0 +1,184 @@
+---
+title: "PRSmix test in COPDGene AA"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(tableone)
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(pROC)
+library(ResourceSelection)
+library(MatchIt)
+```
+
+```{r, message=FALSE, warning=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+options(bitmapType='cairo')
+
+# import functions 
+source("PRSmix_functions.R")
+```
+
+```{r}
+# cgAa df with PRSs from get_PRS.Rmd
+in_path <- 'data/pheno_aa_prs.csv'
+df <- fread(in_path, data.table=F)
+```
+
+```{r}
+# add BMI to pheno
+BMI_pheno <- fread("path/to/pheno.txt", data.table=F)
+BMI_pheno <- BMI_pheno[, c("sid", "BMI_P1")]
+
+df <- merge(df, BMI_pheno, by='sid', how='left')
+```
+
+```{r}
+prs_list <- c("FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs")
+
+# make binary copd variable
+df$copd <- ifelse(df$FEV1_FVC_post_P1 < 0.7 & df$fev1_pp_gli_global_P1 < 80, 1, 
+                      ifelse(df$FEV1_FVC_post_P1 >= 0.7 & df$fev1_pp_gli_global_P1 >= 80, 0, NA))
+
+outcomes <- c("total_Net_Exacerbations", "lung_density_vnb_P1", "Pi10_Thirona_P1", "copd")
+
+pcs=paste0("PC",1:5)
+covars <- c("Age_P1", "gender", "ATS_PackYears_P1", "BMI_P1")
+```
+
+```{r}
+sapply(df[c(prs_list, pcs, covars)], function(x) sum(is.na(x)))
+
+sapply(df[outcomes], function(x) sum(is.na(x)))
+```
+
+# get summary table
+```{r}
+df$exacerbation_rate = df$total_Net_Exacerbations / df$total_days_since_P1 * 365
+
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% summary()
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% sd(na.rm = TRUE)
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% IQR(na.rm = TRUE)
+```
+
+```{r}
+allVars <- c("Age_P1", "gender", "SmokCigNow_P1", "ATS_PackYears_P1", "BMI_P1", "fev1_pp_gli_global_P1", "FEV1_FVC_post_P1", "copd", "exacerbation_rate")
+catVars <- c("gender", "SmokCigNow_P1", "copd")
+table1 <- CreateTableOne(data = df, vars = allVars, factorVars = catVars)
+table1_output <- print(table1, showAllLevels = TRUE)
+
+write.table(table1_output, "data/Table1_demographics_cgAa.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+# Use weights from PRSmix trained in COPD NHW
+```{r}
+# get mix_prs_copd
+df <- scale_PRSmix_other_coh(df, outcome_name_copd="copd", coh="cgNhw")
+```
+
+```{r}
+cor.test(df$BMI_pgs,df$copd)
+```
+
+```{r}
+model <- build_model(df, "copd", "BMI_pgs", pcs, covars, model_type = "binomial", adjustment = NULL)
+model
+```
+
+# Table3_PRSs_copd: COPD predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+Table3_PRSs_copd <- call_model_other_coh(df, outcome_name_copd="copd", outcome_name_other_coh="copd", pcs, covars, model_type = "binomial", adjustment = NULL, coh = "cgNhw", additional_prs = "prs_composite")
+
+prs_order <- c("FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs", "mix_prs_copd", "prs_composite")
+
+Table3_PRSs_copd <- Table3_PRSs_copd[order(match(Table3_PRSs_copd$prs, prs_order)), ]
+
+write.table(Table3_PRSs_copd, "data/Table3_PRSs_copd_cgAa_test.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+Table3_PRSs_copd <- Table3_PRSs_copd %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table3_PRSs_copd, rownames = FALSE)
+```
+
+# Table4_PRSs_exacerbations: exacerbation predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+Table4_PRSs_exacerbations <- call_model_other_coh(df, outcome_name_copd="copd", outcome_name_other_coh="total_Net_Exacerbations", pcs, covars, model_type = "nb", adjustment = "offset(log(total_days_since_P1/365))", coh = "cgNhw", additional_prs = "prs_composite")
+
+Table4_PRSs_exacerbations <- Table4_PRSs_exacerbations[order(match(Table4_PRSs_exacerbations$prs, prs_order)), ]
+
+write.table(Table4_PRSs_exacerbations, "data/Table4_PRSs_exacerbations_cgAa_test.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+Table4_PRSs_exacerbations <- Table4_PRSs_exacerbations %>% mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table4_PRSs_exacerbations, rownames = FALSE)
+```
+
+
+## ROC of COPD predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_copd_complete <- df[complete.cases(df[, "copd"]), ]
+outcome_binary <- "copd"
+
+# print DeLong p-values for PRS-mix vs FF PRS 
+copd_roc_out <- compare_roc_5_models(df_copd_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "COPD predicted by PRSmix vs. FEV1/FVC PRS in cgAa")
+
+DT::datatable(copd_roc_out$auc_table)
+DT::datatable(copd_roc_out$pval_table)
+```
+
+
+## ROC of exacerbations predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_exac_complete <- df[complete.cases(df[, c("total_Net_Exacerbations", "total_days_since_P1")]), ]
+
+outcome <- "total_Net_Exacerbations"
+outcome_binary <- paste0(outcome, "_binary")
+df_exac_complete[[outcome_binary]] <- ifelse(df_exac_complete[[outcome]] >= 2, 1, 0)
+
+# print DeLong p-values for PRS-mix vs FF PRS
+exac_roc_out <- compare_roc_5_models(df_exac_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment="offset(log(total_days_since_P1/365))", plot_title = "Exacerbations predicted by PRSmix vs. FEV1/FVC PRS in cgAa")
+
+DT::datatable(exac_roc_out$auc_table)
+DT::datatable(exac_roc_out$pval_table)
+```
+
+
+# incident rate ratio
+```{r}
+youden_threshold_copd <- 0.3752354
+
+df$youden_group <- ifelse(df$mix_prs_copd > youden_threshold_copd, 1, 0)
+table(df$youden_group)
+```
+
+```{r}
+# get propensity score
+formula_str <- paste0("youden_group ~ ", paste0(c(covars), collapse = " + "))
+
+# propensity score matching 
+m.out <- matchit(as.formula(formula_str), 
+                 data = df, 
+                 method = "nearest")
+
+matched_df <- match.data(m.out)
+```
+
+```{r}
+# calculate irr
+formula_str <- paste0("total_Net_Exacerbations", " ~ youden_group + ", paste0(c(pcs), collapse = " + "))
+irr_model <- glm.nb(as.formula(formula_str), data = matched_df)
+summary(irr_model)
+```
+
+
+```{r}
+cor(df$BMI_P1, df$BMI_pgs)
+```
+

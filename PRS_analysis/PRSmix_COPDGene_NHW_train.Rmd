@@ -1,0 +1,618 @@
+---
+title: "PRSmix in COPDGene NHW with training"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(tableone)
+library(dplyr)
+library(PRSmix)
+library(MASS)
+library(ggplot2)
+library(pROC)
+library(ResourceSelection)
+```
+
+```{r}
+options(bitmapType='cairo')
+
+# import functions 
+source("PRSmix_functions.R")
+```
+
+```{r}
+# cgNhw df with PRSs from get_PRS.Rmd
+in_path <- "data/pheno_nhw_prs.csv"
+df <- fread(in_path, data.table=F)
+```
+
+
+```{r}
+prs_list <- names(df)[grep("_pgs$", names(df))]
+prs_list <- c(prs_list, "FEV1_ePRS", "FF_ePRS")
+
+# make binary copd variable from spirometry 
+df$copd <- ifelse(df$FEV1_FVC_post_P1 < 0.7 & df$fev1_pp_gli_global_P1 < 80, 1, 
+                      ifelse(df$FEV1_FVC_post_P1 >= 0.7 & df$fev1_pp_gli_global_P1 >= 80, 0, NA))
+
+outcomes <- c("total_Net_Exacerbations", "lung_density_vnb_P1", "Pi10_Thirona_P1", "copd")
+
+pcs=paste0("PC",1:5)
+covars <- c("Age_P1", "gender", "ATS_PackYears_P1", "BMI_P1")
+
+print(length(prs_list))
+print(prs_list)
+```
+
+```{r}
+sapply(df[c(prs_list, pcs, covars)], function(x) sum(is.na(x)))
+
+sapply(df[outcomes], function(x) sum(is.na(x)))
+```
+
+```{r}
+df$exacerbation_rate = df$total_Net_Exacerbations / df$total_days_since_P1 * 365
+
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% summary()
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% sd(na.rm = TRUE)
+df %>% filter(copd == 1) %>% pull(exacerbation_rate) %>% IQR(na.rm = TRUE)
+```
+
+# get summary table
+```{r}
+
+allVars <- c("Age_P1", "gender", "SmokCigNow_P1", "ATS_PackYears_P1", "BMI_P1", "fev1_pp_gli_global_P1", "FEV1_FVC_post_P1", "copd", "exacerbation_rate")
+catVars <- c("gender", "SmokCigNow_P1", "copd")
+table1 <- CreateTableOne(data = df, vars = allVars, factorVars = catVars)
+table1_output <- print(table1, showAllLevels = TRUE)
+
+write.table(table1_output, "data/Table1_demographics_cgNhw.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+# loop over outcomes and call PRSmix
+```{r}
+prsmix_covar = c(covars, pcs)
+print(prsmix_covar)
+
+cont_outcomes <- c("total_Net_Exacerbations", "lung_density_vnb_P1", "Pi10_Thirona_P1")
+binary_outcome <- "copd"
+```
+
+```{r results='hide', message=FALSE, warning=FALSE, eval=FALSE}
+# continuous outcomes
+weights_table_list <- list()
+
+for (outcome in cont_outcomes) {
+  call_PRSmix(df, outcome, outcome_binary=FALSE, prsmix_covar, prs_list, coh = "cgNhw", cat_covar_list = c("gender"))
+  out <- scale_PRSmix(df, outcome, coh = "cgNhw")
+  df <- out$df
+  weights_table <- out$weights_table
+  
+  weights_table_list[[outcome]] <- weights_table
+}
+```
+
+```{r results='hide', message=FALSE, warning=FALSE, eval=FALSE}
+# binary outcomes
+call_PRSmix(df, binary_outcome, outcome_binary=TRUE, prsmix_covar, prs_list, coh = "cgNhw", cat_covar_list = c("gender"))
+out <- scale_PRSmix(df, binary_outcome, coh = "cgNhw")
+df <- out$df
+weights_table <- out$weights_table
+
+weights_table_list[[binary_outcome]] <- weights_table
+```
+
+```{r eval=FALSE}
+all_weights_table <- Reduce(function(x, y) merge(x, y, by = "prs", all = TRUE), weights_table_list)
+all_weights_table <- all_weights_table %>% 
+  arrange(desc(copd)) %>%
+  mutate_if(is.numeric, signif, digits=3)
+
+write.table(all_weights_table, "data/TableS3_PRSmix_weights_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+all_weights_table<-read.table("data/Table2_PRSmix_weights_cgNhw.txt", sep = '\t', header = TRUE)
+DT::datatable(all_weights_table)
+```
+
+```{r eval=FALSE}
+# save the df
+fwrite(df, file = "data/cgNhw_PRSmix_out_df.csv")
+```
+
+```{r}
+in_path <- "data/cgNhw_PRSmix_out_df.csv"
+df<-fread(in_path, data.table=F)
+```
+
+# Each outcome predicted by its corresponding PRS
+```{r message=FALSE, warning=FALSE}
+total_Net_Exacerbations_adj <- call_model(df, outcome_name = "total_Net_Exacerbations", pcs, covars, 
+                                             model_type = "nb", adjustment = "offset(log(total_days_since_P1/365))", coh="cgNhw")
+lung_density_vnb_P1_adj <- call_model(df, outcome_name = "lung_density_vnb_P1", pcs, covars, 
+                                         model_type = "lm", adjustment = "scanner_model_clean_P1", coh="cgNhw")
+Pi10_Thirona_P1_adj <- call_model(df, outcome_name = "Pi10_Thirona_P1", pcs, covars, 
+                                  model_type = "lm", adjustment = "scanner_model_clean_P1", coh="cgNhw")
+copd_no_adj <- call_model(df, outcome_name = "copd", pcs, covars, 
+                                  model_type = "binomial", adjustment = NULL, coh="cgNhw")
+```
+
+```{r}
+summary_table <- Reduce(function(x, y) merge(x, y, by = "prs", all = TRUE), 
+                        list(total_Net_Exacerbations_adj[, c(1, 5)], 
+                             lung_density_vnb_P1_adj[, c(1, 5)],
+                             Pi10_Thirona_P1_adj[, c(1, 5)],
+                             copd_no_adj[, c(1, 5)]))
+
+DT::datatable(summary_table)
+```
+
+# Table3_PRSs_copd: copd predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+copd_prs_list <- c("FF_ePRS", "FEV1_ePRS", "Cosentino_pgs", "smoking_pgs", "IPF_pgs", "BMI_pgs", "CRP_pgs", "mix_prs_copd", "prs_composite")
+
+Table3_PRSs_copd <- data.frame()
+
+for (prs in copd_prs_list) {
+  model <- build_model(df, "copd", prs, pcs, covars, model_type = "binomial", adjustment=NULL)
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  Table3_PRSs_copd <- rbind(Table3_PRSs_copd, 
+                                     data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                                beta_ci = beta_ci, se = se, pval = pval))
+}
+
+Table3_PRSs_copd <-Table3_PRSs_copd %>%  mutate_if(is.numeric, signif, digits=3)
+
+DT::datatable(Table3_PRSs_copd, rownames = FALSE)
+```
+
+## adjust for baseline FEV1
+```{r message=FALSE, warning=FALSE}
+Table3_PRSs_copd_adj_fev1 <- data.frame()
+
+for (prs in copd_prs_list) {
+  model <- build_model(df, "copd", prs, pcs, covars, model_type = "binomial", adjustment="FEV1_post_P1")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  Table3_PRSs_copd_adj_fev1 <- rbind(Table3_PRSs_copd_adj_fev1, 
+                                     data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                                beta_ci = beta_ci, se = se, pval = pval))
+}
+
+Table3_PRSs_copd_adj_fev1 <-Table3_PRSs_copd_adj_fev1 %>%  mutate_if(is.numeric, signif, digits=3)
+
+DT::datatable(Table3_PRSs_copd_adj_fev1, rownames = FALSE)
+```
+
+# Table4_PRSs_exacerbations: exacerbation predicted by single PRSs and PRSmix
+```{r message=FALSE, warning=FALSE}
+Table4_PRSs_exacerbations <- data.frame()
+
+for (prs in copd_prs_list) {
+  model <- build_model(df, "total_Net_Exacerbations", prs, pcs, covars, model_type = "nb", adjustment="offset(log(total_days_since_P1/365))")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  Table4_PRSs_exacerbations <- rbind(Table4_PRSs_exacerbations, 
+                                     data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                                beta_ci = beta_ci, se = se, pval = pval))
+}
+
+write.table(Table4_PRSs_exacerbations, "data/Table4_PRSs_exacerbations_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+Table4_PRSs_exacerbations <-Table4_PRSs_exacerbations %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table4_PRSs_exacerbations, rownames = FALSE)
+```
+
+
+## adjust for baseline FEV1
+```{r message=FALSE, warning=FALSE}
+Table4_PRSs_exacerbations_adj_fev1 <- data.frame()
+
+for (prs in copd_prs_list) {
+  model <- build_model(df, "total_Net_Exacerbations", prs, pcs, covars, model_type = "nb", adjustment="offset(log(total_days_since_P1/365)) + FEV1_post_P1")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  Table4_PRSs_exacerbations_adj_fev1 <- rbind(Table4_PRSs_exacerbations_adj_fev1, 
+                                     data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                                beta_ci = beta_ci, se = se, pval = pval))
+}
+
+Table4_PRSs_exacerbations_adj_fev1 <-Table4_PRSs_exacerbations_adj_fev1 %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table4_PRSs_exacerbations_adj_fev1, rownames = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+Table4_PRSs_exacerbations_adj_copd <- data.frame()
+
+for (prs in copd_prs_list) {
+  model <- build_model(df, "total_Net_Exacerbations", prs, pcs, covars, model_type = "nb", adjustment="offset(log(total_days_since_P1/365)) + copd")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  Table4_PRSs_exacerbations_adj_copd <- rbind(Table4_PRSs_exacerbations_adj_copd, 
+                                     data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                                beta_ci = beta_ci, se = se, pval = pval))
+}
+
+Table4_PRSs_exacerbations_adj_copd <-Table4_PRSs_exacerbations_adj_copd %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(Table4_PRSs_exacerbations_adj_copd, rownames = FALSE)
+```
+
+# TableS_PRSmix_assocsOutcomes: take mix_PRS for other outcomes, predict all other outcomes
+## take mix_PRS for other outcomes, predict net exacerbations
+```{r message=FALSE, warning=FALSE}
+# without adjusting for fev1
+mix_prs_list <- grep("^mix_prs_", names(df), value = TRUE)
+
+results_mix_prss_exac <- data.frame()
+
+for (prs in mix_prs_list) {
+  model <- build_model(df, "total_Net_Exacerbations", prs, pcs, covars, model_type = "nb", adjustment="offset(log(total_days_since_P1/365))")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  results_mix_prss_exac <- rbind(results_mix_prss_exac, 
+                                 data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                            beta_ci = beta_ci, se = se, pval = pval))
+}
+results_mix_prss_exac <- results_mix_prss_exac %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(results_mix_prss_exac, rownames = FALSE)
+```
+
+## take mix_PRS for other outcomes, predict copd
+```{r message=FALSE, warning=FALSE}
+results_mix_prss_copd <- data.frame()
+
+for (prs in mix_prs_list) {
+  model <- build_model(df, "copd", prs, pcs, covars, model_type = "binomial", adjustment=NULL)
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  results_mix_prss_copd <- rbind(results_mix_prss_copd, 
+                                 data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                            beta_ci = beta_ci, se = se, pval = pval))
+}
+results_mix_prss_copd <- results_mix_prss_copd %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(results_mix_prss_copd, rownames = FALSE)
+```
+
+## take mix_PRS for other outcomes, predict lung density
+```{r}
+results_mix_prss_ld <- data.frame()
+
+for (prs in mix_prs_list) {
+  model <- build_model(df, "lung_density_vnb_P1", prs, pcs, covars, model_type = "lm", adjustment = "scanner_model_clean_P1")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  results_mix_prss_ld <- rbind(results_mix_prss_ld, 
+                                 data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                            beta_ci = beta_ci, se = se, pval = pval))
+}
+results_mix_prss_ld <- results_mix_prss_ld %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(results_mix_prss_ld, rownames = FALSE)
+```
+
+## take mix_PRS for other outcomes, predict Pi10
+```{r}
+results_mix_prss_pi10 <- data.frame()
+
+for (prs in mix_prs_list) {
+  model <- build_model(df, "Pi10_Thirona_P1", prs, pcs, covars, model_type = "lm", adjustment = "scanner_model_clean_P1")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  results_mix_prss_pi10 <- rbind(results_mix_prss_pi10, 
+                                 data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                            beta_ci = beta_ci, se = se, pval = pval))
+}
+results_mix_prss_pi10 <- results_mix_prss_pi10 %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(results_mix_prss_pi10, rownames = FALSE)
+```
+
+
+```{r}
+exac_results <- results_mix_prss_exac[, c("beta_ci", "pval")]
+colnames(exac_results) <- c("exac_beta_ci", "exac_pval")
+
+ld_results <- results_mix_prss_ld[, c("beta_ci", "pval")]
+colnames(ld_results) <- c("lung_density_beta_ci", "lung_density_pval")
+
+pi10_results <- results_mix_prss_pi10[, c("beta_ci", "pval")]
+colnames(pi10_results) <- c("pi10_beta_ci", "pi10_pval")
+
+copd_results <- results_mix_prss_copd[, c("beta_ci", "pval")]
+colnames(copd_results) <- c("copd_beta_ci", "copd_pval")
+
+TableS_PRSmix_assocsOutcomes <- cbind(exac_results, ld_results, pi10_results, copd_results)
+write.table(TableS_PRSmix_assocsOutcomes, "data/TableS4_PRSmix_assocsOutcomes_cgNhw.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+
+DT::datatable(TableS_PRSmix_assocsOutcomes, options=list(autoWidth = TRUE, scrollX = '400px'))
+```
+
+# Supplemental figures
+## Scatter plot of Pi10 and exacerbations
+```{r fig.width=7, fig.height=5}
+scatter_exac_pi10 <- ggplot(df, aes(x = exacerbation_rate, y = Pi10_Thirona_P1, color = copd)) +
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  # scale_x_log10() + 
+  xlim(0, 5) +
+  labs(x = "Annualized exacerbation rate", y = "Pi10", title = "Scatter plot of exacerbation vs. Pi10 stratified by COPD") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+scatter_exac_pi10
+```
+
+## Scatter plot of PRSmix and exacerbations
+```{r fig.width=7, fig.height=5}
+scatter_exac_copd <- ggplot(df, aes(x = exacerbation_rate, y = mix_prs_copd, color = copd)) +
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  # scale_x_log10() + 
+  xlim(0, 5) +
+  labs(x = "Annualized exacerbation rate", y = "PRSmix", title = "Scatter plot of exacerbation vs. PRSmix stratified by COPD") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+scatter_exac_copd
+```
+
+## ROC of COPD predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_copd_complete <- df[complete.cases(df[, "copd"]), ]
+outcome_binary <- "copd"
+
+# print DeLong p-values for PRS-mix vs FF PRS 
+copd_roc_out <- compare_roc_5_models(df_copd_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "Outcome: COPD")
+
+DT::datatable(copd_roc_out$auc_table)
+DT::datatable(copd_roc_out$pval_table)
+
+write.table(copd_roc_out$auc_table, "data/Table2_auc_copd_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(copd_roc_out$pval_table, "data/Table2_auc_pval_copd_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r results='hide', message=FALSE, warning=FALSE}
+pdf("plots/roc_copd_cgNhw.pdf", width = 7, height = 5)
+compare_roc_5_models(df_copd_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "Outcome: COPD")
+invisible(dev.off())
+
+jpeg("plots/roc_copd_cgNhw.jpg", width = 7, height = 5, units = "in", res = 600)
+compare_roc_5_models(df_copd_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment=NULL, plot_title = "Outcome: COPD")
+invisible(dev.off())
+```
+
+## ROC of exacerbations predicted by PRSmix vs FF PRS
+```{r fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+df_exac_complete <- df[complete.cases(df[, c("total_Net_Exacerbations", "total_days_since_P1")]), ]
+
+outcome <- "total_Net_Exacerbations"
+outcome_binary <- paste0(outcome, "_binary")
+df_exac_complete[[outcome_binary]] <- ifelse(df_exac_complete[[outcome]] >= 2, 1, 0)
+
+# print DeLong p-values for PRS-mix vs FF PRS
+exac_roc_out <- compare_roc_5_models(df_exac_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment="offset(log(total_days_since_P1/365))", plot_title = "Outcome: frequent exacerbator")
+
+DT::datatable(exac_roc_out$auc_table)
+DT::datatable(exac_roc_out$pval_table)
+
+write.table(exac_roc_out$auc_table, "data/Table2_auc_exac_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(exac_roc_out$pval_table, "data/Table2_auc_pval_exac_cgNhw.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+```{r results='hide', message=FALSE, warning=FALSE}
+pdf("plots/roc_exac_cgNhw.pdf", width = 7, height = 5)
+compare_roc_5_models(df_exac_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment="offset(log(total_days_since_P1/365))", plot_title = "Outcome: frequent exacerbator")
+invisible(dev.off())
+
+jpeg("plots/roc_exac_cgNhw.jpg", width = 7, height = 5, units = "in", res = 600)
+compare_roc_5_models(df_exac_complete, outcome_binary, mix_prs="mix_prs_copd", prs_to_compare="FF_ePRS", pcs, covars, adjustment="offset(log(total_days_since_P1/365))", plot_title = "Outcome: frequent exacerbator")
+invisible(dev.off())
+```
+
+# nominal effects
+```{r message=FALSE, warning=FALSE}
+nominal_effect_exac <- data.frame()
+
+for (prs in prs_list) {
+  model <- build_model(df, "total_Net_Exacerbations", prs, pcs, covars, model_type = "nb", adjustment="offset(log(total_days_since_P1/365))")
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  nominal_effect_exac <- rbind(nominal_effect_exac, 
+                               data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                          beta_ci = beta_ci, se = se, pval = pval))
+}
+
+nominal_effect_exac <-nominal_effect_exac %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(nominal_effect_exac, rownames = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+nominal_effect_copd <- data.frame()
+
+for (prs in prs_list) {
+  model <- build_model(df, "copd", prs, pcs, covars, model_type = "binomial", adjustment=NULL)
+  beta <- coef(model)[prs]
+  ci <- confint(model, prs, level = 0.95)
+  beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+  se <- summary(model)$coefficients[prs, "Std. Error"]
+  pval <- summary(model)$coefficients[prs, 4]
+  nominal_effect_copd <- rbind(nominal_effect_copd, 
+                               data.frame(prs = prs, beta = beta, ci_lower = ci[1], ci_upper = ci[2], 
+                                          beta_ci = beta_ci, se = se, pval = pval))
+}
+
+nominal_effect_copd <-nominal_effect_copd %>%  mutate_if(is.numeric, signif, digits=3)
+DT::datatable(nominal_effect_copd, rownames = FALSE)
+```
+
+```{r}
+cor(df$BMI_P1, df$BMI_pgs)
+```
+
+
+# Heritability
+```{r}
+library(fmsb)
+
+## logistic liability
+
+## see appendix B from Lee et al. (https://core.ac.uk/reader/15145948?utm_source=linkout)
+
+## LTRC
+
+calcR2 <- function(dfm,pcsm,prs,ot,K){
+
+
+  require(rms)
+
+  # library(Design)
+
+  require(pROC)
+
+
+
+  ## Choose cohort for calculations
+
+  # dfm <- pheno.ltrc
+
+  # pcsm <- pcs.ltrc
+
+  # ot="ipf.clinpath"
+
+  # prs="prs_ipf"
+
+
+
+  # define parameters
+
+  dfm[,ot] <- as.numeric(dfm[,ot])
+
+  nt=length(dfm[,1])
+
+  ncase=sum(dfm[,ot]==1,na.rm=T)
+
+  ncont=sum(dfm[,ot]==0,na.rm = T)
+
+  # K=63/1e5 # population prevalence
+
+  thd=-qnorm(K,0,1) # the threshold on the normal distribution which   truncates the proportion
+
+  P=ncase/nt # proportion of cases in the case-control samples
+
+  zv=dnorm(thd)
+
+  mv=zv/K
+
+  mv2=-mv*K/(1-K)
+
+
+  
+
+# probit
+
+  pmv=glm(as.formula(paste0("as.numeric(",ot,")~",prs,"+",
+
+                             paste0(pcsm,collapse="+"))),
+
+          data=dfm,family=binomial(probit)) # probit model
+
+  R2=var(pmv$linear.predictors)/(var(pmv$linear.predictors)+1) 
+
+  print(paste0("R2 probit: ",signif(R2,3)))
+
+  
+
+  #logistic liability
+
+  lrmv=glm(as.formula(paste0("as.numeric(",ot,")~",prs,"+",
+
+                             paste0(pcsm,collapse="+"))),
+
+          data=dfm,family=binomial(logit)) # logistic model
+
+  R2.glm=var(lrmv$linear.predictors)/(var(lrmv$linear.predictors)+pi^2/3)
+
+  print(paste0("R2 logistic liability: ",signif(R2.glm,3)))
+
+  
+
+  # R2 on the liability scale using AUC
+
+  # aucv=auc(dfm[,ot],pmv$fitted.values)
+
+  # qv=qnorm(aucv[1]) #Q in equation (11)
+
+  # R2=2*qv^2/((mv2-mv)^2+qv^2*mv*(mv-thd)+mv2*(mv2-thd))
+
+  # print(paste0("R2 liability using AUC: ",signif(R2,3)))
+
+  
+
+  # R2 on the liability scale using the transformation
+
+  lmv=lm(as.formula(paste0("as.numeric(",ot,")~",prs,"+",
+
+                             paste0(pcsm,collapse="+"))),
+
+          data=dfm) #linear model
+
+  R2O=var(lmv$fitted.values)/(ncase/nt*ncont/nt) #R2 on the observed scale
+
+  theta=mv*(P-K)/(1-K)*(mv*(P-K)/(1-K)-thd) #θ in equation (15)
+
+  cv=K*(1-K)/zv^2*K*(1-K)/(P*(1-P)) #C in equation (15)
+
+  R2=R2O*cv/(1+R2O*theta*cv)
+
+
+  print(paste0("R2 on liability scale using transformation: ",signif(R2,3)))
+
+
+
+
+}
+```
+
+```{r}
+calcR2(dfm=df, pcsm=pcs, prs="mix_prs_copd",ot="copd",K=0.5)
+```
+
